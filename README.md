@@ -9,10 +9,16 @@ Built on [Hammerspoon](https://www.hammerspoon.org).
 Everything is in the monitor icon in the menu bar:
 
 - **Save current desktop…**: saves every window on the desktop you're looking at, with its app, size and position. Chrome windows also keep their profile and tabs.
-- **A saved desktop's name**: opens it on the desktop you're on. The usual flow is: swipe up, add a desktop, then pick a saved desktop from the menu. If it's already open, the menu switches to it. A check mark means it's open.
+- **A saved desktop's name**: opens it on the desktop you're on. The usual flow is: swipe up, add a desktop, then pick a saved desktop from the menu. If it's already open somewhere else, the menu switches to it. A check mark means it's open.
+- **The saved desktop you're on** (✓ with an arrow): hover for
+  - **Update Desktop Items**: re-saves the windows now on this desktop under the same name. It only works on the desktop where that saved desktop was opened. The previous version goes to `.backup/`. Hand-edited fields are kept for windows that are still there.
+  - **Close**: see below.
 - **Close ▸ name**: closes that desktop's windows, then quits apps that have no windows left on any desktop. Apps still open elsewhere keep running, and apps ask about unsaved work as usual. Then remove the empty desktop in Mission Control.
-- **Preferences…**: rename (Edit), reorder (drag) and delete saved desktops. The menu follows this order.
-- **Open desktops folder**: the saved configs, in `~/.desktops/`.
+- **Preferences…**: a window with four pages:
+  - **Saved Desktops**: drag to reorder the menu, Edit to rename, Delete.
+  - **Keyboard Shortcuts**: click a desktop's box and press a shortcut (⌃ Control plus ⇧/⌥/⌘ and a letter, number or F-key). Pressing it jumps to that desktop if it's open, otherwise opens it on the current desktop. Combinations macOS or other apps use, and duplicates, are refused.
+  - **Desktops Folder**: where everything is stored (default `~/.desktops`). Changing it moves everything to the new folder.
+  - **About**: version and links.
 
 ## Setup
 
@@ -25,15 +31,18 @@ Code changes take effect after Hammerspoon → Reload Config, or the menu's **Re
 
 ## Files
 
+Paths below assume the default folder; it can be moved in Preferences → Desktops Folder. The chosen location is kept in Hammerspoon's settings (`desktops.folder`).
+
 | Path | What |
 | --- | --- |
 | `~/.desktops/<name>.json` | A saved desktop. Hand-editable (see below) |
 | `~/.desktops/.state/<name>.json` | Window IDs the desktop currently has open. Don't edit |
-| `~/.desktops/.settings.json` | Menu order |
+| `~/.desktops/.settings.json` | Menu order and keyboard shortcuts |
+| `~/.desktops/.backup/<name>.json` | The previous version, kept when a desktop is updated or replaced |
 | `hammerspoon/desktops/init.lua` | Menu, save, open, close |
 | `hammerspoon/desktops/store.lua` | Config, state and settings files |
 | `hammerspoon/desktops/chrome.lua` | Chrome tabs (AppleScript), profiles (`Local State`), launch arguments |
-| `hammerspoon/desktops/prefs.lua` | Preferences window |
+| `hammerspoon/desktops/prefs.lua` | Preferences window (sidebar pages, shortcut recorder) |
 
 ### Config format
 
@@ -63,6 +72,9 @@ Optional per-window fields you can add by hand:
 - **Chrome:** tabs come from AppleScript. The profile is read from the window title or the toolbar's profile button, matched against the names in Chrome's `Local State`. Give every profile a different name.
 
 ## Development notes
+
+- The menu bar icon uses the autosave name `desktops-menu`, so macOS keeps its position across reloads. Without it, the re-created icon can land off-screen.
+- Hammerspoon extensions are loaded at startup (top of `init.lua`). Loading one later prints a message, and that can crash when an `hs` CLI session is attached.
 
 - The `hs` command-line tool can jam if a command runs AppleScript while the CLI waits on it. To test from a shell, queue the work instead: `hs -c 'hs.timer.doAfter(0.1, function() dofile("/tmp/probe.lua") end)'`, and have the probe write its results to a file.
 - `Desktops for macOS — v1 Build Outline.md` is the original plan, which used AeroSpace. That approach was dropped: forced tiling and replacing Spaces didn't fit this workflow.

@@ -3,7 +3,8 @@
 -- again and quit apps nothing else is using.
 -- Load the Hammerspoon extensions up front rather than on first use.
 for _, ext in ipairs({ "hs.webview", "hs.webview.usercontent", "hs.osascript", "hs.dialog", "hs.canvas",
-                       "hs.axuielement", "hs.task", "hs.spaces", "hs.menubar", "hs.json", "hs.eventtap" }) do
+                       "hs.axuielement", "hs.task", "hs.spaces", "hs.menubar", "hs.json", "hs.eventtap", "hs.settings", "hs.urlevent", "hs.hotkey",
+                       "hs.drawing", "hs.screen", "hs.alert", "hs.timer", "hs.geometry", "hs.application", "hs.window" }) do
   require(ext)
 end
 
@@ -252,6 +253,22 @@ end
 
 function M.isOpen(name) return #liveState(name).windows > 0 end
 
+-- Is this saved desktop open on the desktop you're looking at? (The desktop it
+-- was opened or saved on is recorded in its state as `space`.)
+function M.isCurrent(name)
+  local st = liveState(name)
+  if #st.windows == 0 then return false end
+  local here = hs.spaces.focusedSpace()
+  if st.space then return st.space == here end
+  -- Older state without a recorded desktop: go by where its windows are.
+  for _, e in ipairs(st.windows) do
+    for _, sp in ipairs(hs.spaces.windowSpaces(e.id) or {}) do
+      if sp == here then return true end
+    end
+  end
+  return false
+end
+
 -- Switch to the desktop holding a window. Returns true if we're there.
 local function gotoWindowDesktop(id)
   local spaces = hs.spaces.windowSpaces(id) or {}
@@ -268,47 +285,49 @@ end
 
 -- ---- commands --------------------------------------------------------------------
 
-function M.saveCurrent()
-  local wins = currentDesktopWindows()
-  if #wins == 0 then alert("No windows on this desktop to save") return end
+-- Fields Save/Update work out from the live window. Anything else in a saved
+-- entry (launch, keep_running, ...) was added by hand and is kept on Update.
+local CAPTURED = { type = true, app = true, bundle_id = true, title = true, frame = true,
+                   urls = true, profile = true, profile_name = true }
 
-  local button, text = hs.dialog.textPrompt("Save desktop",
-    "Save the " .. #wins .. " window(s) on this desktop as:", "", "Save", "Cancel")
-  if button ~= "Save" then return end
-  local name, why = store.cleanName(text)
-  if not name then hs.dialog.blockAlert("Can't save", why) return end
-  if store.exists(name) then
-    local b = hs.dialog.blockAlert("Replace “" .. name .. "”?",
-      "A desktop with this name is already saved.", "Replace", "Cancel")
-    if b ~= "Replace" then return end
-  end
-
+-- Build a config from windows on this desktop. `old`/`oldState` (for Update)
+-- let hand-edited fields carry over for windows that are still there.
+local function buildConfig(name, wins, old, oldState)
   local warnings = {}
   local chromeWins = {}
   for _, w in ipairs(wins) do
     if bundleOf(w) == chrome.bundleID then table.insert(chromeWins, w) end
   end
-  local captured, profiles, matched = {}, {}, {}
+  local profiles, matched = {}, {}
   if #chromeWins > 0 then
-    local err
-    captured, err = chrome.capture()
+    local captured, err = chrome.capture()
     if not captured then
       captured = {}
       table.insert(warnings, err)
     end
     profiles = chrome.profiles()
-    local pairsFound = chrome.match(chromeWins, captured)
-    for i, w in ipairs(chromeWins) do matched[w:id()] = pairsFound[i] end
+    local found = chrome.match(chromeWins, captured)
+    for i, w in ipairs(chromeWins) do matched[w:id()] = found[i] end
   end
 
-  local cfg = { name = name, saved = os.date("%Y-%m-%d %H:%M"), windows = {} }
-  local state = { windows = {} }
+  local previous = {}  -- window id -> its entry in the old config
+  if old and oldState then
+    for _, e in ipairs(oldState.windows or {}) do previous[e.id] = old.windows[e.index] end
+  end
+
+  local cfg = {}
+  for k, v in pairs(old or {}) do cfg[k] = v end  -- keep hand-added top-level fields
+  cfg.name, cfg.saved, cfg.windows = name, os.date("%Y-%m-%d %H:%M"), {}
+  local state = { space = hs.spaces.focusedSpace(), windows = {} }
+
   for i, w in ipairs(wins) do
     local app = w:application()
+    local prev = previous[w:id()]
     local entry
     if app:bundleID() == chrome.bundleID then
       local c = matched[w:id()]
       local folder, display = chrome.detectProfile(w, profiles)
+      if not folder and prev and prev.profile then folder, display = prev.profile, prev.profile_name end
       if not c then table.insert(warnings, "Couldn't read the tabs of Chrome window “" .. w:title() .. "”.") end
       if not folder then
         local known = {}
@@ -322,17 +341,65 @@ function M.saveCurrent()
       entry = { type = "app", app = app:name(), bundle_id = app:bundleID(), title = w:title() }
     end
     entry.frame = frameOf(w)
+    if prev then
+      for k, v in pairs(prev) do
+        if not CAPTURED[k] then entry[k] = v end
+      end
+    end
     table.insert(cfg.windows, entry)
     table.insert(state.windows, { id = w:id(), index = i })
   end
+  return cfg, state, warnings
+end
 
+local function reportSaved(verb, name, count, warnings)
+  if #warnings > 0 then
+    hs.dialog.blockAlert(verb .. " “" .. name .. "” with warnings", table.concat(warnings, "\n\n"))
+  else
+    alert(verb .. " “" .. name .. "” (" .. count .. " windows)")
+  end
+end
+
+function M.saveCurrent()
+  local wins = currentDesktopWindows()
+  if #wins == 0 then alert("No windows on this desktop to save") return end
+
+  local button, text = hs.dialog.textPrompt("Save desktop",
+    "Save the " .. #wins .. " window(s) on this desktop as:", "", "Save", "Cancel")
+  if button ~= "Save" then return end
+  local name, why = store.cleanName(text)
+  if not name then hs.dialog.blockAlert("Can't save", why) return end
+  if store.exists(name) then
+    local b = hs.dialog.blockAlert("Replace “" .. name .. "”?",
+      "A desktop with this name is already saved.", "Replace", "Cancel")
+    if b ~= "Replace" then return end
+    store.backup(name)
+  end
+
+  local cfg, state, warnings = buildConfig(name, wins)
   if not store.save(cfg) then hs.dialog.blockAlert("Can't save", "Couldn't write " .. store.configPath(name)) return end
   store.saveState(name, state)
-  if #warnings > 0 then
-    hs.dialog.blockAlert("Saved “" .. name .. "” with warnings", table.concat(warnings, "\n\n"))
-  else
-    alert("Saved “" .. name .. "” (" .. #wins .. " windows)")
+  reportSaved("Saved", name, #wins, warnings)
+end
+
+-- Re-save an open desktop from the windows on it now. Only offered (and only
+-- allowed) on the desktop where that saved desktop was opened.
+function M.update(name)
+  if not M.isCurrent(name) then
+    hs.dialog.blockAlert("Can't update “" .. name .. "”",
+      "Switch to the desktop where “" .. name .. "” is open, then choose Update Desktop Items there.")
+    return
   end
+  local wins = currentDesktopWindows()
+  if #wins == 0 then alert("No windows on this desktop to save") return end
+  local old, err = store.load(name)
+  if not old then hs.dialog.blockAlert("Can't update “" .. name .. "”", err) return end
+
+  local cfg, state, warnings = buildConfig(name, wins, old, liveState(name))
+  store.backup(name)
+  if not store.save(cfg) then hs.dialog.blockAlert("Can't update", "Couldn't write " .. store.configPath(name)) return end
+  store.saveState(name, state)
+  reportSaved("Updated", name, #wins, warnings)
 end
 
 function M.open(name)
@@ -353,6 +420,7 @@ function M.open(name)
     end
 
     alert("Opening “" .. name .. "”…")
+    local openedOn = hs.spaces.focusedSpace()
     local placed, taken, failed = {}, {}, {}
     for i, entry in ipairs(cfg.windows) do
       local win = launchAndWait(entry, taken)
@@ -360,7 +428,7 @@ function M.open(name)
         place(win, entry.frame)
         taken[win:id()] = true
         table.insert(placed, { id = win:id(), index = i, win = win })
-        store.saveState(name, { windows = (function()
+        store.saveState(name, { space = openedOn, windows = (function()
           local t = {}
           for _, p in ipairs(placed) do t[#t + 1] = { id = p.id, index = p.index } end
           return t
@@ -456,13 +524,21 @@ local function buildMenu()
   end
   for _, name in ipairs(names) do
     local open = M.isOpen(name)
-    table.insert(items, { title = name, checked = open, fn = function() M.open(name) end })
+    if open and M.isCurrent(name) then
+      -- The saved desktop you're on: hover for actions instead of reopening it.
+      table.insert(items, { title = name, checked = true, menu = {
+        { title = "Update Desktop Items", fn = function() M.update(name) end },
+        { title = "Close", fn = function() M.close(name) end },
+      } })
+    else
+      table.insert(items, { title = name, checked = open, fn = function() M.open(name) end })
+    end
     table.insert(closeItems, { title = name, disabled = not open, fn = function() M.close(name) end })
   end
   table.insert(items, { title = "-" })
   table.insert(items, { title = "Close", menu = closeItems, disabled = #names == 0 })
   table.insert(items, { title = "-" })
-  table.insert(items, { title = "Preferences…", fn = function() prefs.show(M.isOpen) end })
+  table.insert(items, { title = "Preferences…", fn = function() M.showPrefs() end })
   table.insert(items, { title = "Open desktops folder", fn = function()
     hs.fs.mkdir(store.home)
     hs.task.new("/usr/bin/open", nil, { store.home }):start()
@@ -486,12 +562,56 @@ local function monitorIcon()
   return img
 end
 
+-- ---- keyboard shortcuts ----------------------------------------------------------
+
+M.hotkeys = {}
+
+-- A desktop's shortcut: jump to it if it's open, otherwise open it here.
+function M.jump(name)
+  if M.isCurrent(name) then
+    alert("You're on “" .. name .. "”", 1.2)
+    return
+  end
+  M.open(name)
+end
+
+-- (Re)register a hotkey for every saved desktop that has a shortcut.
+function M.bindShortcuts()
+  for _, hk in ipairs(M.hotkeys) do hk:delete() end
+  M.hotkeys = {}
+  local saved = {}
+  for _, n in ipairs(store.list()) do saved[n] = true end
+  for name, sc in pairs(store.shortcuts()) do
+    if saved[name] and type(sc) == "table" and sc.key then
+      local hk = hs.hotkey.new(sc.mods or {}, sc.key, function() M.jump(name) end)
+      if hk then
+        hk:enable()
+        table.insert(M.hotkeys, hk)
+      else
+        log.w("couldn't register shortcut for " .. name)
+      end
+    end
+  end
+end
+
+-- Pause shortcuts while one is being recorded in Preferences.
+function M.pauseShortcuts(paused)
+  for _, hk in ipairs(M.hotkeys) do
+    if paused then hk:disable() else hk:enable() end
+  end
+end
+
+function M.showPrefs()
+  prefs.show(M.isOpen, M.bindShortcuts, M.pauseShortcuts)
+end
+
 function M.start()
   if M.menu then M.menu:delete() end
-  M.menu = hs.menubar.new()
+  M.menu = hs.menubar.new(true, "desktops-menu")  -- autosave name: macOS remembers its position
   M.menu:setIcon(monitorIcon(), true)
   M.menu:setTooltip("Desktops")
   M.menu:setMenu(buildMenu)
+  M.bindShortcuts()
   return M
 end
 

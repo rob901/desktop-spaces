@@ -1,8 +1,12 @@
--- Saved desktop configs (~/.desktops/<name>.json) and runtime state
--- (~/.desktops/.state/<name>.json: the window IDs a desktop opened).
+-- Saved desktop configs (<folder>/<name>.json) and runtime state
+-- (<folder>/.state/<name>.json: the window IDs a desktop opened).
+-- The folder defaults to ~/.desktops and can be changed in Preferences; the
+-- chosen location is remembered in Hammerspoon's settings.
 local M = {}
 
-M.home = os.getenv("DESKTOPS_HOME") or (os.getenv("HOME") .. "/.desktops")
+M.defaultHome = os.getenv("HOME") .. "/.desktops"
+local HOME_KEY = "desktops.folder"
+M.home = hs.settings.get(HOME_KEY) or os.getenv("DESKTOPS_HOME") or M.defaultHome
 
 local function stateDir() return M.home .. "/.state" end
 
@@ -36,6 +40,7 @@ function M.loadSettings()
   local s = exists(settingsPath()) and hs.json.read(settingsPath()) or nil
   if type(s) ~= "table" then s = {} end
   if type(s.order) ~= "table" then s.order = {} end
+  if type(s.shortcuts) ~= "table" then s.shortcuts = {} end
   return s
 end
 
@@ -104,7 +109,10 @@ function M.rename(old, new)
     os.rename(M.statePath(old), tmp)
     os.rename(tmp, M.statePath(name))
   end
-  M.setOrder(order)
+  local s = M.loadSettings()
+  s.order = order
+  s.shortcuts[name], s.shortcuts[old] = s.shortcuts[old], nil
+  M.saveSettings(s)
   return true
 end
 
@@ -113,7 +121,93 @@ function M.delete(name)
   M.clearState(name)
   local order = {}
   for _, n in ipairs(M.list()) do if n ~= name then table.insert(order, n) end end
-  M.setOrder(order)
+  local s = M.loadSettings()
+  s.order = order
+  s.shortcuts[name] = nil
+  M.saveSettings(s)
+end
+
+-- ---- keyboard shortcuts: { [name] = { mods = {"ctrl","shift"}, key = "d" } } ----
+
+function M.shortcuts() return M.loadSettings().shortcuts end
+
+function M.setShortcut(name, shortcut)
+  local s = M.loadSettings()
+  s.shortcuts[name] = shortcut
+  return M.saveSettings(s)
+end
+
+-- ---- moving the desktops folder -------------------------------------------------
+
+local function shellQuote(p) return "'" .. p:gsub("'", "'\\''") .. "'" end
+
+-- Move one file or folder; falls back to /bin/mv across disks.
+local function move(src, dst)
+  if os.rename(src, dst) then return true end
+  local _, ok = hs.execute("/bin/mv " .. shellQuote(src) .. " " .. shellQuote(dst))
+  return ok
+end
+
+local function isDir(p)
+  local a = hs.fs.attributes(p)
+  return a and a.mode == "directory"
+end
+
+-- Move everything to a new folder and use it from now on.
+-- Returns true, or nil and a reason (nothing is moved if a check fails).
+function M.moveHome(target)
+  target = (target or ""):gsub("/+$", "")
+  if target == "" then return nil, "No folder chosen." end
+  local from = M.home
+  if target == from then return true end
+  if target:sub(1, #from + 1) == from .. "/" then
+    return nil, "The new folder can't be inside the current one."
+  end
+  hs.fs.mkdir(target)
+  if not isDir(target) then return nil, "Couldn't create " .. target end
+
+  -- Refuse rather than overwrite saved desktops already in the target.
+  local clashes = {}
+  if exists(from) then
+    for file in hs.fs.dir(from) do
+      if file:match("^[^%.].*%.json$") and exists(target .. "/" .. file) then
+        table.insert(clashes, (file:gsub("%.json$", "")))
+      end
+    end
+  end
+  if #clashes > 0 then
+    table.sort(clashes)
+    return nil, "The new folder already has saved desktops with these names: "
+      .. table.concat(clashes, ", ") .. ". Move or rename them first."
+  end
+
+  local failed = {}
+  if exists(from) then
+    for file in hs.fs.dir(from) do
+      local src, dst = from .. "/" .. file, target .. "/" .. file
+      if file == "." or file == ".." then
+        -- skip
+      elseif file == ".state" or file == ".backup" then
+        hs.fs.mkdir(dst)
+        for inner in hs.fs.dir(src) do
+          if inner ~= "." and inner ~= ".." and not move(src .. "/" .. inner, dst .. "/" .. inner) then
+            table.insert(failed, file .. "/" .. inner)
+          end
+        end
+        os.remove(src)
+      elseif file:match("%.json$") then
+        if not move(src, dst) then table.insert(failed, file) end
+      end
+    end
+  end
+
+  M.home = target
+  hs.settings.set(HOME_KEY, target ~= M.defaultHome and target or nil)
+  os.remove(from)  -- only succeeds if nothing else was left in it
+  if #failed > 0 then
+    return nil, "Now using " .. target .. ", but these couldn't be moved: " .. table.concat(failed, ", ")
+  end
+  return true
 end
 
 function M.load(name)
@@ -122,6 +216,15 @@ function M.load(name)
     return nil, "Couldn't read " .. M.configPath(name)
   end
   return cfg
+end
+
+-- Keep the previous version before overwriting: ~/.desktops/.backup/<name>.json
+function M.backup(name)
+  local cfg = M.load(name)
+  if not cfg then return end
+  ensureDirs()
+  hs.fs.mkdir(M.home .. "/.backup")
+  hs.json.write(cfg, M.home .. "/.backup/" .. name .. ".json", true, true)
 end
 
 function M.save(cfg)
