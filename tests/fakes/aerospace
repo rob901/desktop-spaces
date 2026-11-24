@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Fake AeroSpace CLI (0.21-style flags)."""
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import fakelib  # noqa: E402
+
+FIELDS = ["window-id", "app-name", "app-bundle-id", "workspace", "window-title"]
+
+
+def opt(args, name):
+    if name in args:
+        i = args.index(name)
+        val = args[i + 1]
+        del args[i:i + 2]
+        return val
+    return None
+
+
+def row(w):
+    return {"window-id": w["id"], "app-name": w["app"], "app-bundle-id": w["bundle"],
+            "workspace": w["ws"], "window-title": w["title"]}
+
+
+def main():
+    args = sys.argv[1:]
+    st = fakelib.load()
+    st.setdefault("log", []).append(list(args))
+    cmd, rest = args[0], args[1:]
+    out = ""
+    by_id = {w["id"]: w for w in st["windows"]}
+
+    if cmd == "list-windows":
+        rest.remove("--all")
+        fmt = opt(rest, "--format")
+        rows = [row(w) for w in st["windows"]]
+        if "--json" in rest:
+            out = json.dumps(rows)
+        else:
+            out = "".join("|".join(str(r[f]) for f in FIELDS) + "\n" for r in rows)
+    elif cmd == "list-workspaces":
+        out = st["focused"] + "\n"
+    elif cmd == "workspace":
+        st["focused"] = rest[-1]
+    elif cmd in ("move-node-to-workspace", "focus", "close", "layout", "join-with"):
+        wid = opt(rest, "--window-id")
+        if wid is not None and int(wid) not in by_id:
+            fakelib.save(st)
+            sys.stderr.write(f"Can't find window with ID {wid}\n")
+            return 2
+        if cmd == "move-node-to-workspace":
+            by_id[int(wid)]["ws"] = rest[-1]
+        elif cmd == "close":
+            st["windows"] = [w for w in st["windows"] if w["id"] != int(wid)]
+    elif cmd in ("flatten-workspace-tree", "balance-sizes"):
+        pass
+    else:
+        fakelib.save(st)
+        sys.stderr.write(f"unknown command {cmd}\n")
+        return 2
+    fakelib.save(st)
+    sys.stdout.write(out)
+    return 0
+
+
+sys.exit(main())

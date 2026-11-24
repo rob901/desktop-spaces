@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""Fake macOS `open`: queues a new window in the fake AeroSpace state."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import fakelib  # noqa: E402
+
+args = sys.argv[1:]
+st = fakelib.load()
+
+if "Google Chrome" in args:
+    extra = args[args.index("--args") + 1:] if "--args" in args else []
+    profile = next((a.split("=", 1)[1] for a in extra if a.startswith("--profile-directory=")), "Default")
+    urls = [a for a in extra if not a.startswith("--")]
+    page = urls[0] if urls else "New Tab"
+    pname = st.get("profiles", {}).get(profile, profile)
+    for n in range(1 + st.get("chrome_extra_windows", 0)):
+        title = page if n == 0 else f"Restored {n}"
+        fakelib.add_window(st, app="Google Chrome", bundle="com.google.Chrome",
+                           title=f"{title} - Google Chrome - {pname}", chrome_title=title,
+                           urls=urls if n == 0 else [f"https://restored/{n}"])
+elif "-b" in args:
+    bundle = args[args.index("-b") + 1]
+    app = st["apps"][bundle]
+    fakelib.add_window(st, app=app["app"], bundle=bundle, title=app["title"])
+elif "-a" in args:
+    name = args[args.index("-a") + 1]
+    bundle, app = next((b, a) for b, a in st["apps"].items() if a["app"] == name)
+    fakelib.add_window(st, app=name, bundle=bundle, title=app["title"])
+else:
+    sys.stderr.write("fake open: unsupported args\n")
+    sys.exit(1)
+fakelib.save(st)

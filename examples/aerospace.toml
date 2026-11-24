@@ -1,0 +1,20 @@
+# Add these to ~/.aerospace.toml, then run: aerospace reload-config
+# Replace /Users/YOU with your home folder (exec-and-forget runs with a minimal PATH).
+
+[mode.main.binding]
+# switch between desktops
+alt-d = 'workspace dev'
+alt-r = 'workspace research'
+alt-c = 'workspace comms'
+
+# open (launch + arrange) a saved desktop
+alt-shift-d = 'exec-and-forget /Users/YOU/.local/bin/desktop open dev'
+alt-shift-r = 'exec-and-forget /Users/YOU/.local/bin/desktop open research'
+alt-shift-c = 'exec-and-forget /Users/YOU/.local/bin/desktop open comms'
+
+# usual window moves, for tweaking a layout before re-saving
+alt-h = 'focus left'
+alt-l = 'focus right'
+alt-shift-h = 'move left'
+alt-shift-l = 'move right'
+alt-slash = 'layout tiles horizontal vertical'
