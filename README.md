@@ -1,58 +1,68 @@
-# desktop
+# Desktops
 
-Save named desktops (sets of specific windows in a tiled layout) and open or close them on demand. A thin Python CLI on top of the [AeroSpace](https://github.com/nikitabobko/AeroSpace) window manager.
+A small macOS menu bar tool that saves the windows on a desktop (a Mission Control space) and reopens them later on another desktop, at the same sizes and positions. Closing a desktop closes its windows and quits any app that has nothing left open, to free up memory.
 
-See `Desktops for macOS — v1 Build Outline.md` for the full design.
+Built on [Hammerspoon](https://www.hammerspoon.org).
 
-```
-desktop save <name> [--workspace W] [--force]   # capture the focused workspace
-desktop open <name> [--fresh]                   # launch, place, tile, switch
-desktop close <name>                            # close only this desktop's windows
-desktop list                                    # desktops and open/closed status
-desktop edit <name>                             # edit the config in $EDITOR, then validate
-desktop windows [--workspace W]                 # debug: AeroSpace window IDs and titles
-```
+## How to use it
 
-`open` on a desktop that is already open just switches to it. `--fresh` launches any of its windows that are missing.
+Everything is in the monitor icon in the menu bar:
+
+- **Save current desktop…**: saves every window on the desktop you're looking at, with its app, size and position. Chrome windows also keep their profile and tabs.
+- **A saved desktop's name**: opens it on the desktop you're on. The usual flow is: swipe up, add a desktop, then pick a saved desktop from the menu. If it's already open, the menu switches to it. A check mark means it's open.
+- **Close ▸ name**: closes that desktop's windows, then quits apps that have no windows left on any desktop. Apps still open elsewhere keep running, and apps ask about unsaved work as usual. Then remove the empty desktop in Mission Control.
+- **Preferences…**: rename (Edit), reorder (drag) and delete saved desktops. The menu follows this order.
+- **Open desktops folder**: the saved configs, in `~/.desktops/`.
 
 ## Setup
 
-1. Install AeroSpace: `brew install --cask nikitabobko/tap/aerospace`. Launch it and grant Accessibility.
-2. In Mission Control, reduce to one macOS Space per display. Quit Spencer.
-3. Python 3.9+ (`/usr/bin/python3` from the Xcode Command Line Tools is fine). No packages needed.
-4. Link the script onto your PATH:
-   ```
-   mkdir -p ~/.local/bin
-   ln -s "$PWD/desktop" ~/.local/bin/desktop
-   ```
-5. Add hotkeys from `examples/aerospace.toml` to `~/.aerospace.toml` and run `aerospace reload-config`.
-6. For each desktop: put its windows on one AeroSpace workspace, run `desktop save <name>`, and check `~/.desktops/<name>.json` (especially Chrome `profile`). The first save asks for Automation permission to control Chrome.
+1. `brew install --cask hammerspoon`
+2. `./install.sh`: links `hammerspoon/desktops` into `~/.hammerspoon` and adds the loader to `~/.hammerspoon/init.lua`.
+3. Open Hammerspoon. Grant it Accessibility (System Settings → Privacy & Security → Accessibility) and turn on "Launch Hammerspoon at login".
+4. The first save with a Chrome window asks permission for Hammerspoon to control Chrome. Allow it.
+
+Code changes take effect after Hammerspoon → Reload Config, or the menu's **Reload**.
 
 ## Files
 
-- `~/.desktops/<name>.json`: desktop config. Editable by hand; the format is in the build outline.
-- `~/.desktops/.state/<name>.json`: the AeroSpace window IDs this desktop opened or claimed. Don't edit.
+| Path | What |
+| --- | --- |
+| `~/.desktops/<name>.json` | A saved desktop. Hand-editable (see below) |
+| `~/.desktops/.state/<name>.json` | Window IDs the desktop currently has open. Don't edit |
+| `~/.desktops/.settings.json` | Menu order |
+| `hammerspoon/desktops/init.lua` | Menu, save, open, close |
+| `hammerspoon/desktops/store.lua` | Config, state and settings files |
+| `hammerspoon/desktops/chrome.lua` | Chrome tabs (AppleScript), profiles (`Local State`), launch arguments |
+| `hammerspoon/desktops/prefs.lua` | Preferences window |
 
-## Development
+### Config format
 
+```json
+{
+  "name": "dev",
+  "saved": "2026-11-24 14:30",
+  "windows": [
+    { "type": "chrome", "profile": "Profile 1", "profile_name": "designalytics user",
+      "urls": ["https://github.com"], "title": "GitHub",
+      "frame": { "x": 0, "y": 38, "w": 960, "h": 1166 } },
+    { "type": "app", "app": "Code", "bundle_id": "com.microsoft.VSCode", "title": "myproject",
+      "frame": { "x": 960, "y": 38, "w": 960, "h": 1166 } }
+  ]
+}
 ```
-/usr/bin/python3 -m unittest discover -s tests
-```
 
-The tests run every command against fake `aerospace`, `osascript` and `open` scripts in `tests/fakes/`, so no real windows are touched.
+Optional per-window fields you can add by hand:
 
-Environment overrides (mainly for tests): `DESKTOPS_HOME`, `DESKTOP_AEROSPACE`, `DESKTOP_CHROME_LOCAL_STATE`, `DESKTOP_LAUNCH_TIMEOUT` (seconds, default 20), `DESKTOP_POLL_INTERVAL` (default 0.25).
+- `"launch": ["code", "-n", "~/code/myproject"]`: the command that opens the window, instead of launching the app or choosing File → New Window.
+- `"keep_running": true`: never quit this app when the desktop closes (Slack or Mail, say).
 
-## Spike findings (AeroSpace 0.21.3-Beta)
+## How it works
 
-Confirmed from the installed CLI's `--help`:
+- **Open:** new windows always appear on the desktop you're looking at, so the tool never has to move windows between desktops. That's the part macOS makes hard. For each saved window it launches the app (or asks a running app for a new window), waits for the new window to appear, and sets its frame. It places everything a second time after a second, because some apps resize themselves once loaded.
+- **Close:** switches to the desktop if needed, closes the recorded windows, then quits apps with no windows left. To see windows on *other* desktops it asks the window server directly (CoreGraphics through JavaScript for Automation), because Hammerspoon's accessibility view only covers the current desktop. On a desktop that's showing, only visible windows count: some apps, such as Windows App, hide a closed window instead of destroying it. If it can't tell, it leaves the app running.
+- **Chrome:** tabs come from AppleScript. The profile is read from the window title or the toolbar's profile button, matched against the names in Chrome's `Local State`. Give every profile a different name.
 
-- `--window-id` is supported on `move-node-to-workspace`, `focus`, `close`, `layout` and `join-with`. The wrapper still falls back to "focus, then run the command" if an older version rejects it.
-- `list-windows` accepts `--all`, `--workspace`, `--json` and `--format`.
-- `flatten-workspace-tree` and `balance-sizes` take `--workspace`.
+## Development notes
 
-Still to confirm with the AeroSpace server running:
-
-- [ ] The exact JSON keys `list-windows --all --json --format '%{window-id} %{app-name} %{app-bundle-id} %{workspace} %{window-title}'` returns. The parser expects `window-id`, `app-name`, `app-bundle-id`, `workspace`, `window-title`, and falls back to a pipe-delimited `--format` if JSON fails.
-- [ ] Chrome window titles in AeroSpace (`desktop windows`) versus AppleScript: does the AeroSpace title end in ` - Google Chrome - <profile name>`? Profile detection depends on it.
-- [ ] Whether `--no-restore-last-session` stops a cold-started Chrome from restoring extra windows.
+- The `hs` command-line tool can jam if a command runs AppleScript while the CLI waits on it. To test from a shell, queue the work instead: `hs -c 'hs.timer.doAfter(0.1, function() dofile("/tmp/probe.lua") end)'`, and have the probe write its results to a file.
+- `Desktops for macOS — v1 Build Outline.md` is the original plan, which used AeroSpace. That approach was dropped: forced tiling and replacing Spaces didn't fit this workflow.
