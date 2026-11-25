@@ -4,7 +4,7 @@
 -- Load the Hammerspoon extensions up front rather than on first use.
 for _, ext in ipairs({ "hs.webview", "hs.webview.usercontent", "hs.osascript", "hs.dialog", "hs.canvas",
                        "hs.axuielement", "hs.task", "hs.spaces", "hs.menubar", "hs.json", "hs.eventtap", "hs.settings", "hs.urlevent", "hs.hotkey",
-                       "hs.drawing", "hs.screen", "hs.alert", "hs.timer", "hs.geometry", "hs.application", "hs.window" }) do
+                       "hs.drawing", "hs.styledtext", "hs.image", "hs.screen", "hs.alert", "hs.timer", "hs.geometry", "hs.application", "hs.window" }) do
   require(ext)
 end
 
@@ -771,26 +771,79 @@ end
 
 -- ---- menu bar --------------------------------------------------------------------
 
+local function monitorIcon()
+  local black = { red = 0, green = 0, blue = 0, alpha = 1 }
+  local c = hs.canvas.new({ x = 0, y = 0, w = 18, h = 18 })
+  c[1] = { type = "rectangle", action = "stroke", strokeColor = black, strokeWidth = 1.5,
+           frame = { x = 1.5, y = 2.5, w = 15, h = 10 }, roundedRectRadii = { xRadius = 1.5, yRadius = 1.5 } }
+  c[2] = { type = "rectangle", action = "fill", fillColor = black, frame = { x = 8, y = 12.5, w = 2, h = 2.5 } }
+  c[3] = { type = "rectangle", action = "fill", fillColor = black,
+           frame = { x = 5, y = 14.75, w = 8, h = 1.5 }, roundedRectRadii = { xRadius = 0.75, yRadius = 0.75 } }
+  local img = c:imageFromCanvas()
+  c:delete()
+  return img
+end
+
+-- Menu titles with the desktop's keyboard shortcut right-aligned, like
+-- native menu shortcuts. Returns name -> title (plain name when none set).
+local function menuTitles(names, current)
+  local font = hs.styledtext.defaultFonts.menu or { name = ".AppleSystemUIFont", size = 14 }
+  local labels, nameW, labelW = {}, 0, 0
+  local shortcuts = store.shortcuts()
+  for _, n in ipairs(names) do
+    local sc = shortcuts[n]
+    if type(sc) == "table" and sc.key then labels[n] = prefs.formatShortcut(sc) end
+    nameW = math.max(nameW, hs.drawing.getTextDrawingSize(n, { font = font.name, size = font.size }).w)
+    if labels[n] then
+      labelW = math.max(labelW, hs.drawing.getTextDrawingSize(labels[n], { font = font.name, size = font.size }).w)
+    end
+  end
+  local stop = math.ceil(nameW + 40 + labelW)
+  local titles = {}
+  for _, n in ipairs(names) do
+    local para = { tabStops = { { location = stop, tabStopType = "right" } } }
+    if n == current then
+      -- The desktop you're on: bold.
+      -- (convertFont gives ".SFNS-Bold", which can't be loaded by name and
+      -- silently falls back to regular; the system bold font name works.)
+      local bold = { name = ".AppleSystemUIFontBold", size = font.size }
+      titles[n] = labels[n]
+        and hs.styledtext.new(n .. "\t" .. labels[n], { font = bold, paragraphStyle = para })
+        or hs.styledtext.new(n, { font = bold })
+    elseif labels[n] then
+      titles[n] = hs.styledtext.new(n .. "\t" .. labels[n], { font = font, paragraphStyle = para })
+    else
+      titles[n] = n
+    end
+  end
+  return titles
+end
+
 local function buildMenu()
   local items = {
     { title = "Save current desktop…", fn = function() M.saveCurrent() end },
     { title = "-" },
   }
   local names = store.list()
+  local current
+  for _, name in ipairs(names) do
+    if M.isOpen(name) and M.isCurrent(name) then current = name break end
+  end
+  local titles = menuTitles(names, current)
   local closeItems = {}
   if #names == 0 then
     table.insert(items, { title = "No saved desktops yet", disabled = true })
   end
   for _, name in ipairs(names) do
     local open = M.isOpen(name)
-    if open and M.isCurrent(name) then
+    if name == current then
       -- The saved desktop you're on: hover for actions instead of reopening it.
-      table.insert(items, { title = name, checked = true, menu = {
+      table.insert(items, { title = titles[name], checked = true, menu = {
         { title = "Update Desktop Items", fn = function() M.update(name) end },
         { title = "Close", fn = function() M.close(name) end },
       } })
     else
-      table.insert(items, { title = name, checked = open, fn = function() M.open(name) end })
+      table.insert(items, { title = titles[name], checked = open, fn = function() M.open(name) end })
     end
     table.insert(closeItems, { title = name, disabled = not open, fn = function() M.close(name) end })
   end
@@ -808,18 +861,6 @@ end
 
 -- A small monitor outline, drawn as a template image so it follows the
 -- menu bar's light/dark appearance.
-local function monitorIcon()
-  local black = { red = 0, green = 0, blue = 0, alpha = 1 }
-  local c = hs.canvas.new({ x = 0, y = 0, w = 18, h = 18 })
-  c[1] = { type = "rectangle", action = "stroke", strokeColor = black, strokeWidth = 1.5,
-           frame = { x = 1.5, y = 2.5, w = 15, h = 10 }, roundedRectRadii = { xRadius = 1.5, yRadius = 1.5 } }
-  c[2] = { type = "rectangle", action = "fill", fillColor = black, frame = { x = 8, y = 12.5, w = 2, h = 2.5 } }
-  c[3] = { type = "rectangle", action = "fill", fillColor = black,
-           frame = { x = 5, y = 14.75, w = 8, h = 1.5 }, roundedRectRadii = { xRadius = 0.75, yRadius = 0.75 } }
-  local img = c:imageFromCanvas()
-  c:delete()
-  return img
-end
 
 -- ---- keyboard shortcuts ----------------------------------------------------------
 
@@ -877,5 +918,6 @@ end
 M.store, M.chrome = store, chrome
 M._currentDesktopWindows, M._appHasWindows, M._alive = currentDesktopWindows, appHasWindows, alive
 M._windowServerWindows, M._idsOnDesktops = windowServerWindows, idsOnDesktops
+M._buildMenu = buildMenu
 M._closeWithTabs = function(w, cb) run(function() cb(closeWithTabs(w)) end) end
 return M

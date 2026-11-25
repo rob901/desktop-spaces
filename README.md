@@ -9,8 +9,8 @@ Built on [Hammerspoon](https://www.hammerspoon.org).
 Everything is in the monitor icon in the menu bar:
 
 - **Save current desktop…**: saves every window on the desktop you're looking at, with its app, size and position. Chrome windows record which profile they use, and each reopens as a new window in that profile. Tabs aren't saved.
-- **A saved desktop's name**: opens it on the desktop you're on. The usual flow is: swipe up, add a desktop, then pick a saved desktop from the menu. If it's already open somewhere else, the menu switches to it. A check mark means it's open.
-- **The saved desktop you're on** (✓ with an arrow): hover for
+- **A saved desktop's name**: opens it on the desktop you're on. The usual flow is: swipe up, add a desktop, then pick a saved desktop from the menu. If it's already open somewhere else, the menu switches to it. A check mark means it's open. A desktop's keyboard shortcut, if set, shows on the right.
+- **The saved desktop you're on** (bold, ✓ with an arrow): hover for
   - **Update Desktop Items**: re-saves the windows now on this desktop under the same name. It only works on the desktop where that saved desktop was opened. The previous version goes to `.backup/`. Hand-edited fields are kept for windows that are still there.
   - **Close**: see below.
 - **Close ▸ name**: closes that desktop. Apps used only on this desktop are quit with their windows still open, so they keep their state (see "App state" below). Apps also open on another desktop just get this desktop's windows closed and keep running. Apps ask about unsaved work as usual. Then remove the empty desktop in Mission Control.
