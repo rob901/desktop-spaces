@@ -29,27 +29,52 @@ local function alert(msg, secs) hs.alert.show(msg, secs or 2.5) end
 -- ---- async helpers ------------------------------------------------------------
 -- Commands run as coroutines so waiting for windows doesn't freeze Hammerspoon.
 
-local busy = false
+local busy, busySince, busyWhat = false, 0, nil
+M.busyTimeout = 90        -- seconds; a request running longer is assumed stuck
+
+-- Dialogs from inside a request are shown after it has finished, so a dialog
+-- you haven't seen (behind windows, or on another desktop) can't keep
+-- Desktops "busy".
+local function notify(title, text)
+  hs.timer.doAfter(0.1, function() hs.dialog.blockAlert(title, text) end)
+end
 
 local function resume(co, ...)
   local ok, err = coroutine.resume(co, ...)
   if not ok then
     busy = false
     log.e(debug.traceback(co, err))
-    hs.dialog.blockAlert("Desktops error", tostring(err))
+    notify("Desktops error", tostring(err))
   end
 end
 
+-- Timers are kept referenced until they fire, so the garbage collector can't
+-- drop one and leave a request waiting forever.
+local pendingTimers = {}
 local function sleep(secs)
   local co = coroutine.running()
-  hs.timer.doAfter(secs, function() resume(co) end)
+  local t
+  t = hs.timer.doAfter(secs, function() pendingTimers[t] = nil; resume(co) end)
+  pendingTimers[t] = true
   coroutine.yield()
 end
 
-local function run(fn)
-  if busy then alert("Desktops is still working on the last request") return end
-  busy = true
-  resume(coroutine.create(function() fn(); busy = false end))
+local function run(fn, what)
+  if busy then
+    local age = hs.timer.secondsSinceEpoch() - busySince
+    if age < M.busyTimeout then
+      alert("Desktops is still working on the last request (" .. (busyWhat or "?") .. ")")
+      return
+    end
+    log.w(string.format("request %q still running after %ds; assuming it's stuck", busyWhat or "?", math.floor(age)))
+  end
+  busy, busySince, busyWhat = true, hs.timer.secondsSinceEpoch(), what
+  log.i("start: " .. (what or "?"))
+  resume(coroutine.create(function()
+    fn()
+    busy = false
+    log.i(string.format("done: %s (%.1fs)", what or "?", hs.timer.secondsSinceEpoch() - busySince))
+  end))
 end
 
 -- ---- windows -------------------------------------------------------------------
@@ -145,17 +170,19 @@ end
 -- When unsure, answers true.
 local function appUsedElsewhere(app, here, ours)
   for _, w in ipairs(app:allWindows()) do
-    if w:isMinimized() and not ours[w:id()] then return true end
+    if w:isMinimized() and not ours[w:id()] then return true, "minimized window " .. w:id() end
   end
   local wins = windowServerWindows()
-  if not wins then return true end
+  if not wins then return true, "couldn't list windows" end
   local desktopOf, pid = idsOnDesktops(), app:pid()
   local showing = {}
   for _, sp in pairs(hs.spaces.activeSpaces() or {}) do showing[sp] = true end
   for _, w in ipairs(wins) do
     local sp = desktopOf[w.id]
     if w.pid == pid and sp and sp ~= here and not ours[w.id] and w.w >= 100 and w.h >= 100 then
-      if w.onscreen or not showing[sp] then return true end
+      if w.onscreen or not showing[sp] then
+        return true, string.format("window %d (%dx%d) on desktop %s", w.id, w.w, w.h, tostring(sp))
+      end
     end
   end
   return false
@@ -352,6 +379,18 @@ end
 
 local function liveState(name)
   local st = store.loadState(name)
+  -- Saved before the last restart: those windows are gone (and their IDs may
+  -- now belong to other windows).
+  -- (The recorded startup time can shift by a second or so; allow for that.)
+  local stale = st.boot and math.abs(st.boot - store.bootTime()) > 120
+  if not st.boot and #st.windows > 0 then  -- older state files: go by when it was written
+    local attrs = hs.fs.attributes(store.statePath(name))
+    stale = attrs ~= nil and attrs.modification < store.bootTime() - 5
+  end
+  if stale then
+    store.clearState(name)
+    return { windows = {} }
+  end
   local live = {}
   for _, e in ipairs(st.windows) do
     if alive(e.id) then table.insert(live, e) end
@@ -503,7 +542,7 @@ end
 function M.open(name)
   run(function()
     local cfg, err = store.load(name)
-    if not cfg then hs.dialog.blockAlert("Can't open “" .. name .. "”", err) return end
+    if not cfg then notify("Can't open “" .. name .. "”", err) return end
     local st = liveState(name)
     if #st.windows > 0 then
       store.saveState(name, st)
@@ -591,13 +630,13 @@ function M.open(name)
     if placed[#placed] then placed[#placed].win:focus() end
 
     if #failed > 0 then
-      hs.dialog.blockAlert("Opened “" .. name .. "” with problems",
+      notify("Opened “" .. name .. "” with problems",
         "These windows didn't appear within " .. M.launchTimeout .. " seconds:\n" .. table.concat(failed, "\n"))
     else
       alert("Opened “" .. name .. "”"
         .. (#strays > 0 and ("\n" .. table.concat(strays, ", ") .. " restored a window onto another desktop") or ""), #strays > 0 and 5 or nil)
     end
-  end)
+  end, "open " .. name)
 end
 
 -- Closing a tabbed window (Terminal, Finder...) with its close button only
@@ -711,7 +750,17 @@ function M.close(name)
     local quit, quitting, apps, closed = {}, {}, {}, 0
     for _, b in ipairs(order) do
       local g = groups[b]
-      if not g.keep and g.app and not NEVER_QUIT[b] and not appUsedElsewhere(g.app, here, ours) then
+      local elsewhere, why = false, nil
+      if not g.keep and g.app and not NEVER_QUIT[b] then elsewhere, why = appUsedElsewhere(g.app, here, ours) end
+      local appName = g.app and g.app:name() or b
+      if g.keep or not g.app or NEVER_QUIT[b] then
+        log.i(appName .. ": closing " .. #g.wins .. " window(s), app kept running (keep_running / never quit)")
+      elseif elsewhere then
+        log.i(appName .. ": closing " .. #g.wins .. " window(s) only; app also in use elsewhere: " .. why)
+      else
+        log.i(appName .. ": quitting (only on this desktop)")
+      end
+      if not g.keep and g.app and not NEVER_QUIT[b] and not elsewhere then
         enableResume(b)
         quitting[b] = g.app
         closed = closed + #g.wins
@@ -766,7 +815,7 @@ function M.close(name)
     alert("Closed “" .. name .. "”: " .. closed .. " window(s)"
       .. (#quit > 0 and ("; quit " .. table.concat(quit, ", ")) or "")
       .. (#waiting > 0 and ("\n" .. table.concat(waiting, ", ") .. " is waiting for you (unsaved changes?)") or ""), 4)
-  end)
+  end, "close " .. name)
 end
 
 -- ---- menu bar --------------------------------------------------------------------
@@ -906,6 +955,10 @@ function M.showPrefs()
 end
 
 function M.start()
+  -- Cap how long one accessibility call waits on an app (default is several
+  -- seconds per call). Right after login, apps that are still starting can
+  -- otherwise stall window lookups for minutes.
+  if hs.window.timeout then pcall(hs.window.timeout, 2) end
   if M.menu then M.menu:delete() end
   M.menu = hs.menubar.new(true, "desktops-menu")  -- autosave name: macOS remembers its position
   M.menu:setIcon(monitorIcon(), true)

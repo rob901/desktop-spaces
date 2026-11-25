@@ -240,9 +240,21 @@ function M.loadState(name)
   return st
 end
 
+-- When this Mac last started up. Window IDs start over after a restart, so
+-- state saved before then describes windows that no longer exist.
+local bootTime
+function M.bootTime()
+  if not bootTime then
+    local out = hs.execute("/usr/sbin/sysctl -n kern.boottime") or ""
+    bootTime = tonumber(out:match("sec = (%d+)")) or 0
+  end
+  return bootTime
+end
+
 function M.saveState(name, st)
   ensureDirs()
   if #st.windows == 0 then return M.clearState(name) end
+  st.boot = M.bootTime()
   return hs.json.write(st, M.statePath(name), true, true)
 end
 
