@@ -16,6 +16,7 @@ local M = {}
 
 M.launchTimeout = 20      -- seconds to wait for a launched window
 M.newWindowAfter = 4      -- running app shows no new window: try "New Window" after this
+M.restoreWait = 5         -- after launching an app, how long its restored windows may take to appear
 local NEVER_QUIT = {
   ["com.apple.finder"] = true,
   ["org.hammerspoon.Hammerspoon"] = true,
@@ -69,11 +70,19 @@ end
 local function currentDesktopWindows()
   local onSpace = {}
   for _, id in ipairs(hs.spaces.windowsForSpace(hs.spaces.focusedSpace()) or {}) do onSpace[id] = true end
-  local ordered, out = hs.window.orderedWindows(), {}
-  for i = #ordered, 1, -1 do
-    local w = ordered[i]
+  -- Tabs (Terminal, Finder...) show up as separate windows sharing one frame;
+  -- keep only the frontmost of each group so a tabbed window counts once.
+  local ordered, out, seen = hs.window.orderedWindows(), {}, {}
+  for _, w in ipairs(ordered) do -- front to back
     local b = bundleOf(w)
-    if onSpace[w:id()] and w:isStandard() and b and not IGNORE[b] then table.insert(out, w) end
+    if onSpace[w:id()] and w:isStandard() and b and not IGNORE[b] then
+      local f = w:frame()
+      local key = string.format("%s|%d|%d|%d|%d", b, f.x, f.y, f.w, f.h)
+      if not seen[key] then
+        seen[key] = true
+        table.insert(out, 1, w) -- result is back to front
+      end
+    end
   end
   return out
 end
@@ -111,10 +120,6 @@ local function appHasWindows(app)
   for _, w in ipairs(app:allWindows()) do
     if w:isStandard() or w:isMinimized() then return true end
   end
-  if app:bundleID() == chrome.bundleID then
-    local wins = chrome.capture()
-    return wins == nil or #wins > 0
-  end
   -- Windows on other desktops are invisible to the accessibility API.
   local wins = windowServerWindows()
   if not wins then return true end
@@ -132,6 +137,57 @@ local function appHasWindows(app)
     end
   end
   return false
+end
+
+-- Does the app have windows anywhere other than desktop `here`? Used before
+-- closing, to decide whether the whole app can be quit (keeping its state).
+-- Windows in `ours` (this desktop's recorded windows) never count.
+-- When unsure, answers true.
+local function appUsedElsewhere(app, here, ours)
+  for _, w in ipairs(app:allWindows()) do
+    if w:isMinimized() and not ours[w:id()] then return true end
+  end
+  local wins = windowServerWindows()
+  if not wins then return true end
+  local desktopOf, pid = idsOnDesktops(), app:pid()
+  local showing = {}
+  for _, sp in pairs(hs.spaces.activeSpaces() or {}) do showing[sp] = true end
+  for _, w in ipairs(wins) do
+    local sp = desktopOf[w.id]
+    if w.pid == pid and sp and sp ~= here and not ours[w.id] and w.w >= 100 and w.h >= 100 then
+      if w.onscreen or not showing[sp] then return true end
+    end
+  end
+  return false
+end
+
+-- macOS Resume: an app restores its windows (documents, Terminal tabs...) on
+-- the next launch. Off by default system-wide ("Close windows when quitting an
+-- application"); turned on here only for apps in saved desktops.
+--
+-- Resume also puts each window back on the desktop it was on, if that desktop
+-- still exists, and macOS no longer lets us move it from there. So apps that
+-- restore their own session (and then open on the current desktop) are left
+-- alone: these, and any Electron app (Slack, VS Code, Claude...).
+local OWN_RESTORE = {
+  ["com.sublimetext.4"] = true, ["com.sublimetext.3"] = true,
+  ["com.microsoft.VSCode"] = true, ["dev.zed.Zed"] = true,
+  ["com.google.Chrome"] = true, ["com.tinyspeck.slackmacgap"] = true,
+  ["com.anthropic.claudefordesktop"] = true,
+}
+local function restoresItself(bundle)
+  if OWN_RESTORE[bundle] then return true end
+  local app = hs.application.get(bundle)
+  local path = app and app:path()
+  return path ~= nil and hs.fs.attributes(path .. "/Contents/Frameworks/Electron Framework.framework") ~= nil
+end
+
+local resumeEnabled = {}
+local function enableResume(bundle)
+  if not bundle or resumeEnabled[bundle] or not bundle:match("^[%w%.%-_]+$") then return end
+  resumeEnabled[bundle] = true
+  if restoresItself(bundle) then return end
+  hs.execute("/usr/bin/defaults write " .. bundle .. " NSQuitAlwaysKeepsWindows -bool true")
 end
 
 local function frameOf(win)
@@ -192,17 +248,61 @@ local function belongs(win, entry)
   return app and app:name() == entry.app
 end
 
+-- Pick the window for an entry: same title first, otherwise the first one.
+local function pickByTitle(found, entry)
+  for _, w in ipairs(found) do
+    if entry.title and w:title() == entry.title then return w end
+  end
+  return found[1]
+end
+
+-- Windows that appeared since the desktop started opening (restored by an app
+-- this open launched) and fit the entry. For Chrome, the profile must match.
+local function restoredFor(entry, taken, ctx)
+  local found = {}
+  for _, w in ipairs(hs.window.allWindows()) do
+    if not ctx.before[w:id()] and not taken[w:id()] and w:isStandard() and belongs(w, entry) then
+      local ok = true
+      if entry.type == "chrome" and entry.profile then
+        ctx.profiles = ctx.profiles or chrome.profiles()
+        local p = chrome.detectProfile(w, ctx.profiles)
+        ok = (p == nil or p == entry.profile)
+      end
+      if ok then table.insert(found, w) end
+    end
+  end
+  return found
+end
+
 -- Start the entry's window and wait for it to appear. Returns the window or nil.
-local function launchAndWait(entry, taken)
+-- ctx (shared across one open): before = window IDs present when the open
+-- started; launched = bundle -> time this open launched that app.
+local function launchAndWait(entry, taken, ctx)
+  local bundle = entry.type == "chrome" and chrome.bundleID or entry.bundle_id
+
+  -- An app this open launched may have restored this window already (Resume
+  -- or its own session restore). Use it rather than opening another; give
+  -- the app a few seconds after launch to bring all its windows back.
+  local launchedAt = bundle and ctx.launched[bundle]
+  repeat
+    local found = restoredFor(entry, taken, ctx)
+    if #found > 0 then return pickByTitle(found, entry), true end
+    if not launchedAt or hs.timer.secondsSinceEpoch() - launchedAt > M.restoreWait then break end
+    sleep(0.25)
+  until false
+
   local before = {}
   for _, w in ipairs(hs.window.allWindows()) do before[w:id()] = true end
 
-  local bundle = entry.type == "chrome" and chrome.bundleID or entry.bundle_id
   local app = bundle and hs.application.get(bundle)
-  if entry.type == "chrome" then
+  if bundle and not app then ctx.launched[bundle] = hs.timer.secondsSinceEpoch() end
+  local function openChrome(forceNewWindow)
     local argv = { "/usr/bin/open" }
-    for _, a in ipairs(chrome.launchArgs(entry.profile, entry.urls)) do argv[#argv + 1] = a end
+    for _, a in ipairs(chrome.launchArgs(entry.profile, entry.urls, forceNewWindow)) do argv[#argv + 1] = a end
     runTask(argv)
+  end
+  if entry.type == "chrome" then
+    openChrome(false)
   elseif entry.launch then
     runTask(entry.launch)
   elseif app then
@@ -213,27 +313,36 @@ local function launchAndWait(entry, taken)
     hs.application.launchOrFocus(entry.app)
   end
 
-  local triedNew = entry.type == "chrome" or entry.launch ~= nil or app ~= nil
+  -- Chrome opened as "start this profile" (for its startup pages) may just bring
+  -- an existing window of that profile forward; then ask for a new window.
+  local chromeFallback = entry.type == "chrome" and app ~= nil and not (entry.urls and #entry.urls > 0)
+  local triedNew = chromeFallback == false and (entry.type == "chrome" or entry.launch ~= nil or app ~= nil)
   local start = hs.timer.secondsSinceEpoch()
   while hs.timer.secondsSinceEpoch() - start < M.launchTimeout do
     sleep(0.25)
     local found = {}
     for _, w in ipairs(hs.window.allWindows()) do
       if not before[w:id()] and not taken[w:id()] and w:isStandard() and belongs(w, entry) then
-        table.insert(found, w)
+        local ok = true
+        if entry.type == "chrome" and entry.profile then
+          -- A freshly launched Chrome can restore other profiles' windows too.
+          ctx.profiles = ctx.profiles or chrome.profiles()
+          local p = chrome.detectProfile(w, ctx.profiles)
+          ok = (p == nil or p == entry.profile)
+        end
+        if ok then table.insert(found, w) end
       end
     end
-    if #found > 0 then
-      for _, w in ipairs(found) do
-        if entry.title and w:title() == entry.title then return w end
-      end
-      return found[1]
-    end
+    if #found > 0 then return pickByTitle(found, entry) end
     -- App launched but restored no window: ask it for one.
     if not triedNew and hs.timer.secondsSinceEpoch() - start > M.newWindowAfter then
       triedNew = true
-      local a = bundle and hs.application.get(bundle) or hs.application.get(entry.app)
-      if a then newWindow(a) end
+      if entry.type == "chrome" then
+        openChrome(true)
+      else
+        local a = bundle and hs.application.get(bundle) or hs.application.get(entry.app)
+        if a then newWindow(a) end
+      end
     end
   end
   return nil
@@ -286,28 +395,19 @@ end
 -- ---- commands --------------------------------------------------------------------
 
 -- Fields Save/Update work out from the live window. Anything else in a saved
--- entry (launch, keep_running, ...) was added by hand and is kept on Update.
+-- entry (launch, keep_running, urls, ...) was added by hand and is kept on Update.
 local CAPTURED = { type = true, app = true, bundle_id = true, title = true, frame = true,
-                   urls = true, profile = true, profile_name = true }
+                   profile = true, profile_name = true }
 
 -- Build a config from windows on this desktop. `old`/`oldState` (for Update)
 -- let hand-edited fields carry over for windows that are still there.
 local function buildConfig(name, wins, old, oldState)
   local warnings = {}
-  local chromeWins = {}
+  -- Chrome windows are saved by profile (not tabs): each reopens as a new
+  -- window in that profile.
+  local profiles = {}
   for _, w in ipairs(wins) do
-    if bundleOf(w) == chrome.bundleID then table.insert(chromeWins, w) end
-  end
-  local profiles, matched = {}, {}
-  if #chromeWins > 0 then
-    local captured, err = chrome.capture()
-    if not captured then
-      captured = {}
-      table.insert(warnings, err)
-    end
-    profiles = chrome.profiles()
-    local found = chrome.match(chromeWins, captured)
-    for i, w in ipairs(chromeWins) do matched[w:id()] = found[i] end
+    if bundleOf(w) == chrome.bundleID then profiles = chrome.profiles() break end
   end
 
   local previous = {}  -- window id -> its entry in the old config
@@ -325,22 +425,20 @@ local function buildConfig(name, wins, old, oldState)
     local prev = previous[w:id()]
     local entry
     if app:bundleID() == chrome.bundleID then
-      local c = matched[w:id()]
       local folder, display = chrome.detectProfile(w, profiles)
       if not folder and prev and prev.profile then folder, display = prev.profile, prev.profile_name end
-      if not c then table.insert(warnings, "Couldn't read the tabs of Chrome window “" .. w:title() .. "”.") end
       if not folder then
         local known = {}
         for f, n in pairs(profiles) do table.insert(known, n .. " = " .. f) end
         table.insert(warnings, "Chrome window “" .. w:title() .. "”: couldn't tell which profile it uses. "
           .. "Set \"profile\" in the file (" .. table.concat(known, ", ") .. ").")
       end
-      entry = { type = "chrome", profile = folder, profile_name = display,
-                urls = c and c.urls or {}, title = w:title() }
+      entry = { type = "chrome", profile = folder, profile_name = display, title = w:title() }
     else
       entry = { type = "app", app = app:name(), bundle_id = app:bundleID(), title = w:title() }
     end
     entry.frame = frameOf(w)
+    enableResume(app:bundleID())
     if prev then
       for k, v in pairs(prev) do
         if not CAPTURED[k] then entry[k] = v end
@@ -422,8 +520,12 @@ function M.open(name)
     alert("Opening “" .. name .. "”…")
     local openedOn = hs.spaces.focusedSpace()
     local placed, taken, failed = {}, {}, {}
+    local ctx = { before = {}, launched = {} }
+    for _, w in ipairs(hs.window.allWindows()) do ctx.before[w:id()] = true end
+    local wsBefore = {}
+    for _, w in ipairs(windowServerWindows() or {}) do wsBefore[w.id] = true end
     for i, entry in ipairs(cfg.windows) do
-      local win = launchAndWait(entry, taken)
+      local win = launchAndWait(entry, taken, ctx)
       if win then
         place(win, entry.frame)
         taken[win:id()] = true
@@ -440,6 +542,51 @@ function M.open(name)
 
     -- Some apps resize themselves once loaded; place everything again.
     sleep(1.0)
+
+    -- Restored windows no saved entry claimed (the app had more open when it
+    -- quit) stay where the app put them, but belong to this desktop now, so
+    -- Close handles them too.
+    local extra = 0
+    if next(ctx.launched) then
+      local onSpace = {}
+      for _, id in ipairs(hs.spaces.windowsForSpace(openedOn) or {}) do onSpace[id] = true end
+      local t = {}
+      for _, p in ipairs(placed) do t[#t + 1] = { id = p.id, index = p.index } end
+      for _, w in ipairs(hs.window.allWindows()) do
+        local b = bundleOf(w)
+        if b and ctx.launched[b] and not ctx.before[w:id()] and not taken[w:id()] and onSpace[w:id()] and w:isStandard() then
+          taken[w:id()] = true
+          t[#t + 1] = { id = w:id() }
+          extra = extra + 1
+        end
+      end
+      if extra > 0 then store.saveState(name, { space = openedOn, windows = t }) end
+    end
+
+    -- macOS Resume puts restored windows back on the desktop they were on
+    -- (if it still exists), and they can't be moved from here. Say so.
+    local strays = {}
+    if next(ctx.launched) then
+      local desktopOf = idsOnDesktops()
+      local pids = {}
+      for b in pairs(ctx.launched) do
+        local a = hs.application.get(b)
+        if a then pids[a:pid()] = a:name() end
+      end
+      local seen = {}
+      for _, w in ipairs(windowServerWindows() or {}) do
+        local sp = desktopOf[w.id]
+        if pids[w.pid] and not wsBefore[w.id] and sp and sp ~= openedOn and w.w >= 100 and w.h >= 100
+          and not seen[w.pid] then
+          seen[w.pid] = true
+          table.insert(strays, pids[w.pid])
+        end
+      end
+      if #strays > 0 then
+        table.sort(strays)
+        log.i("restored onto another desktop: " .. table.concat(strays, ", "))
+      end
+    end
     for _, p in ipairs(placed) do place(p.win, cfg.windows[p.index].frame) end
     if placed[#placed] then placed[#placed].win:focus() end
 
@@ -447,9 +594,82 @@ function M.open(name)
       hs.dialog.blockAlert("Opened “" .. name .. "” with problems",
         "These windows didn't appear within " .. M.launchTimeout .. " seconds:\n" .. table.concat(failed, "\n"))
     else
-      alert("Opened “" .. name .. "”")
+      alert("Opened “" .. name .. "”"
+        .. (#strays > 0 and ("\n" .. table.concat(strays, ", ") .. " restored a window onto another desktop") or ""), #strays > 0 and 5 or nil)
     end
   end)
+end
+
+-- Closing a tabbed window (Terminal, Finder...) with its close button only
+-- closes the selected tab; the next tab then appears as a new window (its
+-- frame can differ, since the tab bar goes away). Must run inside run().
+local CLOSE_WINDOW_MENUS = { { "Shell", "Close Window" }, { "File", "Close Window" } }
+
+local function appWindowsHere(app)
+  local onSpace, out = {}, {}
+  for _, id in ipairs(hs.spaces.windowsForSpace(hs.spaces.focusedSpace()) or {}) do onSpace[id] = true end
+  for _, o in ipairs(app:allWindows()) do
+    if onSpace[o:id()] and o:isStandard() then out[#out + 1] = o end
+  end
+  return out
+end
+
+local function closeWithTabs(w)
+  local app = w:application()
+  if not app then return w:close() end
+  local before = {}
+  for _, o in ipairs(appWindowsHere(app)) do before[o:id()] = true end
+
+  -- Preferred: the app's own "Close Window" (Terminal: Shell → Close Window),
+  -- which closes every tab. The app must really be frontmost with this window
+  -- focused, otherwise the menu item is disabled and pressing it does nothing
+  -- (right after a menu bar click, Hammerspoon is frontmost).
+  local path
+  for _, p in ipairs(CLOSE_WINDOW_MENUS) do
+    if app:findMenuItem(p) then path = p break end
+  end
+  if path then
+    local ready = false
+    for i = 1, 20 do
+      if i == 1 or i == 8 then app:activate(true); w:focus() end
+      sleep(0.1)
+      local front, fw = hs.application.frontmostApplication(), hs.window.focusedWindow()
+      local item = app:findMenuItem(path)
+      if front and front:pid() == app:pid() and fw and fw:id() == w:id() and item and item.enabled then
+        ready = true break
+      end
+    end
+    if ready and app:selectMenuItem(path) then
+      for _ = 1, 20 do
+        sleep(0.1)
+        if not hs.window.get(w:id()) then return true end
+      end
+    end
+    if not hs.window.get(w:id()) then return true end
+    log.i("Close Window didn't close " .. app:name() .. " window " .. w:id()
+      .. " (ready=" .. tostring(ready) .. "); closing tab by tab")
+  end
+
+  -- Fallback: close button, then keep closing windows of this app that newly
+  -- appear on this desktop (the revealed tabs).
+  local ok = w:close()
+  for _ = 1, 30 do
+    if not ok then break end
+    local revealed
+    for _ = 1, 5 do
+      sleep(0.15)
+      if hs.window.get(w:id()) then return ok end -- still open (e.g. "terminate running processes?")
+      for _, o in ipairs(appWindowsHere(app)) do
+        if not before[o:id()] then revealed = o break end
+      end
+      if revealed then break end
+    end
+    if not revealed then break end
+    w = revealed
+    before[w:id()] = true
+    ok = w:close()
+  end
+  return ok
 end
 
 function M.close(name)
@@ -466,28 +686,65 @@ function M.close(name)
       return
     end
 
-    local apps, keep, closed = {}, {}, 0
+    -- Group this desktop's windows by app.
+    local here = hs.spaces.focusedSpace()
+    local groups, order, ours = {}, {}, {}
     for _, e in ipairs(st.windows) do
       local w = hs.window.get(e.id)
-      local entry = cfg.windows[e.index] or {}
-      if w then
-        local app = w:application()
-        local b = app and app:bundleID()
-        if b then
-          apps[b] = app
-          if entry.keep_running then keep[b] = true end
-        end
-        if w:close() then closed = closed + 1 end
+      local app = w and w:application()
+      local b = app and app:bundleID()
+      if w then ours[w:id()] = true end
+      if b then
+        if not groups[b] then groups[b] = { app = app, wins = {} } table.insert(order, b) end
+        table.insert(groups[b].wins, w)
+        if (cfg.windows[e.index] or {}).keep_running then groups[b].keep = true end
+      elseif w then
+        groups["?" .. w:id()] = { wins = { w }, keep = true }
+        table.insert(order, "?" .. w:id())
       end
     end
+
+    -- Apps used only on this desktop are quit with their windows still open,
+    -- so they save their state (Resume, or the app's own session restore) and
+    -- bring it back when the desktop is opened again. Apps also open on other
+    -- desktops (or marked keep_running) only get this desktop's windows closed.
+    local quit, quitting, apps, closed = {}, {}, {}, 0
+    for _, b in ipairs(order) do
+      local g = groups[b]
+      if not g.keep and g.app and not NEVER_QUIT[b] and not appUsedElsewhere(g.app, here, ours) then
+        enableResume(b)
+        quitting[b] = g.app
+        closed = closed + #g.wins
+        g.app:kill()
+      else
+        if g.app and not g.keep and not NEVER_QUIT[b] then apps[b] = g.app end
+        for _, w in ipairs(g.wins) do
+          if closeWithTabs(w) then closed = closed + 1 end
+        end
+      end
+    end
+
     store.clearState(name)
+
+    -- Wait (up to 6s) for quitting apps to exit. One that's still running is
+    -- most likely asking about unsaved changes.
+    for _ = 1, 12 do
+      if next(quitting) == nil then break end
+      sleep(0.5)
+      for b, app in pairs(quitting) do
+        if not app:isRunning() then
+          table.insert(quit, app:name())
+          quitting[b] = nil
+        end
+      end
+    end
+    local waiting = {}
+    for _, app in pairs(quitting) do table.insert(waiting, app:name()) end
 
     -- Give windows a moment to finish closing (up to 3s), then quit apps
     -- that have nothing left open anywhere.
-    local quit, pending = {}, {}
-    for b, app in pairs(apps) do
-      if not keep[b] and not NEVER_QUIT[b] then pending[b] = app end
-    end
+    local pending = {}
+    for b, app in pairs(apps) do pending[b] = app end
     for _ = 1, 6 do
       sleep(0.5)
       for b, app in pairs(pending) do
@@ -505,8 +762,10 @@ function M.close(name)
     for _, app in pairs(pending) do table.insert(kept, app:name()) end
     if #kept > 0 then log.i("left running (windows elsewhere): " .. table.concat(kept, ", ")) end
     table.sort(quit)
+    table.sort(waiting)
     alert("Closed “" .. name .. "”: " .. closed .. " window(s)"
-      .. (#quit > 0 and ("; quit " .. table.concat(quit, ", ")) or ""), 3.5)
+      .. (#quit > 0 and ("; quit " .. table.concat(quit, ", ")) or "")
+      .. (#waiting > 0 and ("\n" .. table.concat(waiting, ", ") .. " is waiting for you (unsaved changes?)") or ""), 4)
   end)
 end
 
@@ -618,4 +877,5 @@ end
 M.store, M.chrome = store, chrome
 M._currentDesktopWindows, M._appHasWindows, M._alive = currentDesktopWindows, appHasWindows, alive
 M._windowServerWindows, M._idsOnDesktops = windowServerWindows, idsOnDesktops
+M._closeWithTabs = function(w, cb) run(function() cb(closeWithTabs(w)) end) end
 return M
